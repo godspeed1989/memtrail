@@ -511,7 +511,7 @@ class Parser:
 
                 frames.append(symbol)
 
-        assert frames
+        #assert frames
         return frames
     
     def handle_event(self, stamp, addr, ssize, frames):

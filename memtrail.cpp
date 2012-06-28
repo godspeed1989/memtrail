@@ -43,6 +43,8 @@
 
 #include <execinfo.h>
 
+#include "list.h"
+
 
 #if __GNUC__ >= 4
    #define PUBLIC __attribute__ ((visibility("default")))
@@ -122,15 +124,28 @@ real_free(void *ptr)
 
 
 struct header_t {
+   struct list_head list_head;
    size_t size;
+   ssize_t factor;
+   bool pending;
    void *ptr;
+   void *addrs[MAX_STACK];
+   size_t addr_count;
 };
 
 
 static pthread_mutex_t
 mutex = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
 
-static size_t total_size = 0;
+static size_t
+total_size = 0;
+
+static size_t
+max_size = 0;
+
+struct list_head
+hdr_list = { &hdr_list, &hdr_list };
+
 
 static int fd = -1;
 
@@ -306,52 +321,106 @@ _gzopen(const char *name, int oflag, mode_t mode)
 }
 
 
+static inline void 
+_log(struct header_t *hdr) {
+   const void *ptr = hdr->ptr;
+   ssize_t size = hdr->size * hdr->factor;
+
+   if (fd < 0) {
+      mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
+      fd = _gzopen("memtrail.data", O_WRONLY | O_CREAT | O_TRUNC, mode);
+
+      if (fd < 0) {
+         fprintf(stderr, "could not open memtrail.data\n");
+         abort();
+      }
+
+   }
+   PipeBuf buf(fd);
+
+   buf.write(&ptr, sizeof ptr);
+   buf.write(&size, sizeof size);
+
+
+   unsigned char c = (unsigned char) hdr->addr_count;
+   buf.write(&c, 1);
+
+   for (size_t i = 0; i < hdr->addr_count; ++i) {
+      void *addr = hdr->addrs[i];
+      _lookup(buf, addr);
+   }
+}
+
+void _flush(void) {
+   struct header_t *it;
+   struct header_t *tmp;
+   for (it = (struct header_t *)hdr_list.next,
+	     tmp = (struct header_t *)it->list_head.next;
+        &it->list_head != &hdr_list;
+	     it = tmp, tmp = (struct header_t *)tmp->list_head.next) {
+      assert(it->pending);
+      if (it->addr_count) {
+         _log(it);
+      }
+      it->pending = false;
+      list_del(&it->list_head);
+   }
+}
+
+static inline void
+init(struct header_t *hdr,
+   size_t size,
+   void *ptr)
+{
+   hdr->size = size;
+   hdr->ptr = ptr;
+   hdr->pending = 0;
+}
+
+
 /**
  * Update/log changes to memory allocations.
  */
+
 static inline void
-_update(const void *ptr, ssize_t size) {
+_update(struct header_t *hdr, ssize_t factor = 1) {
+   hdr->factor = factor;
+   ssize_t size = hdr->size * factor;
+
    pthread_mutex_lock(&mutex);
+
    static int recursion = 0;
 
    if (recursion++ <= 0) {
-      void *addrs[MAX_STACK];
-      size_t count = backtrace(addrs, ARRAY_SIZE(addrs));
-
-      total_size += size;
-
-      if (fd < 0) {
-         mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
-         fd = _gzopen("memtrail.data", O_WRONLY | O_CREAT | O_TRUNC, mode);
-
-         if (fd < 0) {
-            fprintf(stderr, "could not open memtrail.data\n");
-            abort();
-         }
-
+      hdr->addr_count = backtrace(hdr->addrs, ARRAY_SIZE(hdr->addrs));
+      
+      if (hdr->pending) {
+         assert(factor < -1);
+         hdr->pending = false;
+         list_del(&hdr->list_head); 
+      } else {
+         hdr->pending = true;
+         list_add(&hdr->list_head, &hdr_list); 
       }
-
-      PipeBuf buf(fd);
-
-      buf.write(&ptr, sizeof ptr);
-      buf.write(&size, sizeof size);
-
-
-      unsigned char c = (unsigned char) count;
-      buf.write(&c, 1);
-
-      for (size_t i = 0; i < count; ++i) {
-         void *addr = addrs[i];
-         _lookup(buf, addr);
+   
+      total_size += size;
+   
+      if (total_size >= max_size) {
+        _flush();
       }
    } else {
-       //fprintf(stderr, "memtrail: warning: recursion\n");
+      //fprintf(stderr, "memtrail: warning: recursion\n");
+      hdr->addr_count = 0;
    }
    --recursion;
 
    pthread_mutex_unlock(&mutex);
 }
 
+
+/*
+ * C
+ */
 
 PUBLIC int
 posix_memalign(void **memptr, size_t alignment, size_t size)
@@ -374,18 +443,16 @@ posix_memalign(void **memptr, size_t alignment, size_t size)
 
    hdr = (struct header_t *)((((size_t)ptr + sizeof *hdr + alignment - 1) & ~(alignment - 1)) - sizeof *hdr);
 
-   hdr->size = size;
-   hdr->ptr = ptr;
+   init(hdr, size, ptr);
    res = &hdr[1];
    assert(((size_t)res & (alignment - 1)) == 0);
 
-   _update(res, size);
+   _update(hdr);
 
    *memptr = res;
 
    return 0;
 }
-
 
 
 static inline void *
@@ -399,16 +466,17 @@ _malloc(size_t size)
       return NULL;
    }
 
-   hdr->size = size;
-   hdr->ptr = hdr;
+   init(hdr, size, hdr);
    res = &hdr[1];
 
-   _update(res, size);
+   _update(hdr);
 
    return res;
 }
 
-static inline void _free(void *ptr)
+
+static inline void
+_free(void *ptr)
 {
    struct header_t *hdr;
 
@@ -418,7 +486,7 @@ static inline void _free(void *ptr)
 
    hdr = (struct header_t *)ptr - 1;
 
-   _update(ptr, -hdr->size);
+   _update(hdr, -1);
 
    real_free(hdr->ptr);
 }
@@ -429,6 +497,7 @@ malloc(size_t size)
 {
    return _malloc(size);
 }
+
 
 PUBLIC void
 free(void *ptr)
@@ -466,14 +535,6 @@ realloc(void *ptr, size_t size)
 
    hdr = (struct header_t *)ptr - 1;
 
-#if 0
-   if (hdr->size >= size) {
-      _update(ptr, size - hdr->size);
-      hdr->size = size;
-      return ptr;
-   }
-#endif
-  
    new_ptr = _malloc(size);
    if (new_ptr) {
       size_t min_size = hdr->size >= size ? size : hdr->size;
@@ -483,6 +544,11 @@ realloc(void *ptr, size_t size)
 
    return new_ptr;
 }
+
+
+/*
+ * C++
+ */
 
 
 PUBLIC void *
@@ -508,6 +574,10 @@ operator delete[] (void *ptr) {
    _free(ptr);
 }
 
+
+/*
+ * Constructor/destructor
+ */
 
 class Main
 {
