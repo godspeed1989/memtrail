@@ -242,8 +242,10 @@ _gzopen(const char *name, int oflag, mode_t mode)
    pid = fork();
    switch (pid) {
    case -1:
-      fprintf(stderr, "memtrail: error: could not fork\n");
-      abort();
+      fprintf(stderr, "memtrail: warning could not fork\n");
+      close(parentToChild[READ_FD]);
+      close(parentToChild[WRITE_FD]);
+      return open(name, oflag, mode);
 
    case 0:
       // child
@@ -276,11 +278,8 @@ _gzopen(const char *name, int oflag, mode_t mode)
 }
 
 
-static inline void 
-_log(struct header_t *hdr) {
-   const void *ptr = hdr->ptr;
-   ssize_t size = hdr->allocated ? (ssize_t)hdr->size : -(ssize_t)hdr->size;
-
+static void
+_open(void) {
    if (fd < 0) {
       mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
       fd = _gzopen("memtrail.data", O_WRONLY | O_CREAT | O_TRUNC, mode);
@@ -290,7 +289,27 @@ _log(struct header_t *hdr) {
          abort();
       }
 
+      unsigned char c = sizeof(void *);
+      ssize_t ret;
+      ret = ::write(fd, &c, sizeof c);
+      assert(ret >= 0 && (size_t)ret == sizeof c);
    }
+}
+
+
+static void
+_close() {
+   if (fd >= 0) {
+      close(fd);
+   }
+}
+
+
+static inline void 
+_log(struct header_t *hdr) {
+   const void *ptr = hdr->ptr;
+   ssize_t size = hdr->allocated ? (ssize_t)hdr->size : -(ssize_t)hdr->size;
+
    PipeBuf buf(fd);
 
    buf.write(&ptr, sizeof ptr);
@@ -677,12 +696,15 @@ public:
    Main() {
       // Only trace the current process.
       unsetenv("LD_PRELOAD");
+      _open();
    }
 
    ~Main() {
       pthread_mutex_lock(&mutex);
       _flush();
       pthread_mutex_unlock(&mutex);
+
+      _close();
 
       fprintf(stderr, "memtrail: maximum %lu bytes\n", max_size);
       fprintf(stderr, "memtrail: leaked %lu bytes\n", total_size);
