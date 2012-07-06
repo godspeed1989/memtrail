@@ -71,12 +71,19 @@ extern "C" void __libc_free(void *ptr);
 
 struct header_t {
    struct list_head list_head;
-   size_t size;
-   ssize_t factor;
-   bool pending;
+
+   // Real pointer
    void *ptr;
+
+   // Size
+   size_t size;
+
+   unsigned allocated:1;
+   unsigned pending:1;
+   unsigned internal:1;
+
+   unsigned char addr_count;
    void *addrs[MAX_STACK];
-   size_t addr_count;
 };
 
 
@@ -272,7 +279,7 @@ _gzopen(const char *name, int oflag, mode_t mode)
 static inline void 
 _log(struct header_t *hdr) {
    const void *ptr = hdr->ptr;
-   ssize_t size = hdr->size * hdr->factor;
+   ssize_t size = hdr->allocated ? (ssize_t)hdr->size : -(ssize_t)hdr->size;
 
    if (fd < 0) {
       mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
@@ -308,11 +315,11 @@ void _flush(void) {
 	     it = tmp, tmp = (struct header_t *)tmp->list_head.next) {
       assert(it->pending);
       //fprintf(stderr, "flush %p %lu\n", &it[1], it->size);
-      if (it->addr_count) {
+      if (!it->internal) {
          _log(it);
       }
       list_del(&it->list_head);
-      if (it->factor < 0) {
+      if (!it->allocated) {
          __libc_free(it->ptr);
       } else {
          it->pending = false;
@@ -325,9 +332,11 @@ init(struct header_t *hdr,
    size_t size,
    void *ptr)
 {
-   hdr->size = size;
    hdr->ptr = ptr;
-   hdr->pending = 0;
+   hdr->size = size;
+   hdr->allocated = true;
+   hdr->pending = false;
+   hdr->internal = false;
 }
 
 
@@ -336,24 +345,24 @@ init(struct header_t *hdr,
  */
 
 static inline void
-_update(struct header_t *hdr, ssize_t factor = 1) {
+_update(struct header_t *hdr, bool allocating = true) {
 
    pthread_mutex_lock(&mutex);
 
    static int recursion = 0;
 
    if (recursion++ <= 0) {
-      if (factor < 0 && max_size == total_size) {
+      if (!allocating && max_size == total_size) {
          _flush();
       }
       
-      hdr->factor = factor;
-      ssize_t size = hdr->size * factor;
+      hdr->allocated = allocating;
+      ssize_t size = allocating ? (ssize_t)hdr->size : -(ssize_t)hdr->size;
 
       hdr->addr_count = backtrace(hdr->addrs, ARRAY_SIZE(hdr->addrs));
       
       if (hdr->pending) {
-         assert(factor < 0);
+         assert(!allocating);
          hdr->pending = false;
          list_del(&hdr->list_head); 
       } else {
@@ -369,11 +378,11 @@ _update(struct header_t *hdr, ssize_t factor = 1) {
       }
    } else {
       //fprintf(stderr, "memtrail: warning: recursion\n");
-      hdr->addr_count = 0;
+      hdr->internal = true;
 
       assert(!hdr->pending);
       if (!hdr->pending) {
-         if (factor < 0) {
+         if (!allocating) {
             __libc_free(hdr->ptr);
          }
       }
@@ -447,7 +456,7 @@ _free(void *ptr)
 
    hdr = (struct header_t *)ptr - 1;
 
-   _update(hdr, -1);
+   _update(hdr, false);
 
    //fprintf(stderr, "free %p %lu\n", ptr, hdr->size);
 }
