@@ -83,10 +83,10 @@ struct header_t {
 static pthread_mutex_t
 mutex = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
 
-static size_t
+static ssize_t
 total_size = 0;
 
-static size_t
+static ssize_t
 max_size = 0;
 
 struct list_head
@@ -300,6 +300,7 @@ _log(struct header_t *hdr) {
 }
 
 void _flush(void) {
+   fprintf(stderr, "flush: total_size = %lu, max_size = %lu\n", total_size, max_size);
    struct header_t *it;
    struct header_t *tmp;
    for (it = (struct header_t *)hdr_list.next,
@@ -307,11 +308,16 @@ void _flush(void) {
         &it->list_head != &hdr_list;
 	     it = tmp, tmp = (struct header_t *)tmp->list_head.next) {
       assert(it->pending);
+      //fprintf(stderr, "flush %p %lu\n", &it[1], it->size);
       if (it->addr_count) {
          _log(it);
       }
-      it->pending = false;
       list_del(&it->list_head);
+      if (it->factor < 0) {
+         __libc_free(it->ptr);
+      } else {
+         it->pending = false;
+      }
    }
 }
 
@@ -332,18 +338,23 @@ init(struct header_t *hdr,
 
 static inline void
 _update(struct header_t *hdr, ssize_t factor = 1) {
-   hdr->factor = factor;
-   ssize_t size = hdr->size * factor;
 
    pthread_mutex_lock(&mutex);
 
    static int recursion = 0;
 
    if (recursion++ <= 0) {
+      if (factor < 0 && max_size == total_size) {
+         _flush();
+      }
+      
+      hdr->factor = factor;
+      ssize_t size = hdr->size * factor;
+
       hdr->addr_count = backtrace(hdr->addrs, ARRAY_SIZE(hdr->addrs));
       
       if (hdr->pending) {
-         assert(factor < -1);
+         assert(factor < 0);
          hdr->pending = false;
          list_del(&hdr->list_head); 
       } else {
@@ -352,13 +363,22 @@ _update(struct header_t *hdr, ssize_t factor = 1) {
       }
    
       total_size += size;
+      assert(total_size >= 0);
    
       if (total_size >= max_size) {
-        _flush();
+         max_size = total_size;
       }
    } else {
       //fprintf(stderr, "memtrail: warning: recursion\n");
       hdr->addr_count = 0;
+
+      assert(!hdr->pending);
+      if (!hdr->pending) {
+         if (factor < 0) {
+            __libc_free(hdr->ptr);
+         }
+      }
+
    }
    --recursion;
 
@@ -388,6 +408,7 @@ _memalign(size_t alignment, size_t size)
    init(hdr, size, ptr);
    res = &hdr[1];
    assert(((size_t)res & (alignment - 1)) == 0);
+   //fprintf(stderr, "alloc %p %lu\n", res, size);
 
    _update(hdr);
 
@@ -408,6 +429,7 @@ _malloc(size_t size)
 
    init(hdr, size, hdr);
    res = &hdr[1];
+   //fprintf(stderr, "alloc %p %lu\n", res, size);
 
    _update(hdr);
 
@@ -428,7 +450,7 @@ _free(void *ptr)
 
    _update(hdr, -1);
 
-   __libc_free(hdr->ptr);
+   //fprintf(stderr, "free %p %lu\n", ptr, hdr->size);
 }
 
 
@@ -650,6 +672,10 @@ public:
    }
 
    ~Main() {
+      pthread_mutex_lock(&mutex);
+      _flush();
+      pthread_mutex_unlock(&mutex);
+
       fprintf(stderr, "memtrail: %lu bytes leaked\n", total_size);
    }
 };
