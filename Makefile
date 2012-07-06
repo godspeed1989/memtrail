@@ -13,11 +13,13 @@ pre-test: libmemtrail.so memtrail.sym
 	nm --dynamic --defined-only libmemtrail.so | sed -n 's/^[0-9a-fA-F]\+ T //p' | diff -du memtrail.sym -
 
 test: pre-test sample
+	rm -f memtrail.data
 	./memtrail record ./sample
 	./memtrail dump
 	./memtrail report
 
 test-debug: libmemtrail.so sample
+	rm -f memtrail.data
 	./memtrail record --debug ./sample
 
 clean:
