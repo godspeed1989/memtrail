@@ -300,7 +300,6 @@ _log(struct header_t *hdr) {
 }
 
 void _flush(void) {
-   fprintf(stderr, "flush: total_size = %lu, max_size = %lu\n", total_size, max_size);
    struct header_t *it;
    struct header_t *tmp;
    for (it = (struct header_t *)hdr_list.next,
@@ -676,7 +675,8 @@ public:
       _flush();
       pthread_mutex_unlock(&mutex);
 
-      fprintf(stderr, "memtrail: %lu bytes leaked\n", total_size);
+      fprintf(stderr, "memtrail: maximum %lu bytes\n", max_size);
+      fprintf(stderr, "memtrail: leaked %lu bytes\n", total_size);
    }
 };
 
